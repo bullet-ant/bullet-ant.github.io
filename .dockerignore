@@ -1,0 +1,14 @@
+.git
+.gitignore
+.gitmodules
+.dockerignore
+Dockerfile
+*.md
+_site
+.jekyll-cache
+.jekyll-metadata
+.bundle
+vendor
+node_modules
+.idea
+.devcontainer
