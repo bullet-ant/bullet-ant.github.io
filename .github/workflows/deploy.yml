@@ -1,0 +1,144 @@
+name: Build and deploy static site
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# The workflow only needs to read the repository. Deployment uses SSH, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Chirpy's last-modified plugin uses the Git history.
+          fetch-depth: 0
+
+      - name: Set up Ruby and cache gems
+        uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Build production site
+        env:
+          JEKYLL_ENV: production
+        run: bundle exec jekyll build --destination _site
+
+      - name: Verify generated site
+        run: |
+          set -euo pipefail
+          test -f _site/index.html
+          bundle exec htmlproofer _site \
+            --disable-external \
+            --ignore-urls "/^http:\/\/127.0.0.1/,/^http:\/\/0.0.0.0/,/^http:\/\/localhost/"
+
+      - name: Upload generated site
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: static-site-${{ github.sha }}
+          path: _site/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+  deploy:
+    name: Deploy to DigitalOcean
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    concurrency:
+      group: production-website
+      # Do not interrupt an rsync already modifying the live directory.
+      cancel-in-progress: false
+
+    steps:
+      - name: Download generated site
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: static-site-${{ github.sha }}
+          path: _site
+
+      - name: Reject unexpected symbolic links
+        run: |
+          set -euo pipefail
+          if find _site -type l -print -quit | grep -q .; then
+            echo "Refusing to deploy an artifact containing symbolic links." >&2
+            exit 1
+          fi
+
+      - name: Deploy generated files with rsync
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          : "${DEPLOY_HOST:?DEPLOY_HOST is not configured}"
+          : "${DEPLOY_USER:?DEPLOY_USER is not configured}"
+          : "${DEPLOY_SSH_KEY:?DEPLOY_SSH_KEY is not configured}"
+          : "${DEPLOY_KNOWN_HOSTS:?DEPLOY_KNOWN_HOSTS is not configured}"
+          DEPLOY_PORT="${DEPLOY_PORT:-22}"
+
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid DEPLOY_HOST" >&2; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid DEPLOY_USER" >&2; exit 1; }
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] && (( DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535 )) || {
+            echo "Invalid DEPLOY_PORT" >&2
+            exit 1
+          }
+
+          ssh_dir="$RUNNER_TEMP/ssh"
+          key_file="$ssh_dir/deploy_key"
+          known_hosts_file="$ssh_dir/known_hosts"
+          install -d -m 700 "$ssh_dir"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$key_file"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$known_hosts_file"
+          chmod 600 "$key_file" "$known_hosts_file"
+          ssh-keygen -y -f "$key_file" >/dev/null
+
+          ssh_options=(
+            -i "$key_file"
+            -p "$DEPLOY_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$known_hosts_file"
+          )
+
+          ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            'test -d /srv/website && test -w /srv/website && command -v rsync >/dev/null'
+
+          rsync \
+            --recursive \
+            --links \
+            --perms \
+            --times \
+            --compress \
+            --checksum \
+            --delete \
+            --delete-delay \
+            --delay-updates \
+            --chmod=D755,F644 \
+            --itemize-changes \
+            -e "ssh -i $key_file -p $DEPLOY_PORT -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts_file" \
+            _site/ \
+            "$DEPLOY_USER@$DEPLOY_HOST:/srv/website/"
